@@ -1,2 +1,4 @@
 docker-compose\subfolderWithSSL\.env
-
+docker-compose/withPostgres/.env
+docker-compose/withPostgresAndWorker/.env
+docker-caddy/.env
