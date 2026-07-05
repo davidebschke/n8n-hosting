@@ -61,6 +61,7 @@ All three use the same n8n container image, differentiated by command/args.
 | [task-runners.yaml](./examples/task-runners.yaml) | Queue mode with task runner sidecars |
 | [production-s3.yaml](./examples/production-s3.yaml) | Production with S3, HPA, multi-main |
 | [keda-autoscaling.yaml](./examples/keda-autoscaling.yaml) | Redis queue-length scaling with KEDA |
+| [https-ingress.yaml](./examples/https-ingress.yaml) | HTTPS Ingress with TLS and webhook processor routing |
 
 ## Secret Management
 
@@ -69,6 +70,35 @@ All three use the same n8n container image, differentiated by command/args.
 3. **Redis password** (`redis.passwordSecret`): optional, for authenticated Redis — queue mode only
 
 For production, use an external secrets operator (e.g., [External Secrets Operator](https://external-secrets.io/)) rather than storing secrets in values files.
+
+## Ingress and HTTPS
+
+Set `ingress.enabled=true` to create the main Ingress for the n8n UI, API, and test webhooks. Configure `ingress.className`, controller-specific `ingress.annotations`, and `ingress.tls` for HTTPS termination. For cert-manager, add the issuer annotation and set `ingress.tls[].secretName` to the certificate Secret cert-manager should create.
+
+When `webhookProcessor.enabled=true`, enable `ingress.webhookProcessor.enabled` to create a second Ingress for production webhook traffic. The webhook processor Ingress routes `/webhook/`, `/webhook-waiting/`, `/form/`, and `/form-waiting/` to webhook processor pods. Test webhook paths such as `/webhook-test/` stay on the main Ingress.
+
+Use `ingress.sticky.enabled=true` for nginx cookie affinity, or `service.sessionAffinity.enabled=true` for Kubernetes `ClientIP` affinity. Multi-main deployments require sticky sessions at the load-balancing layer.
+
+See [https-ingress.yaml](./examples/https-ingress.yaml) for a complete HTTPS example.
+
+## Ports and Health Checks
+
+| Component | Port | Health check |
+|---|---:|---|
+| main | `service.port` (default `5678`) | HTTP liveness `/healthz`; readiness `/healthz/readiness` |
+| webhook-processor | `service.port` (default `5678`) | HTTP liveness `/healthz`; readiness `/healthz/readiness` |
+| worker | no Service | exec probe checks the `n8n worker` process |
+| task runner broker | `taskRunners.broker.port` (default `5679`) | localhost broker used by task runner sidecars |
+
+Workers consume jobs from Redis and do not receive inbound HTTP traffic, so the chart intentionally does not create a Kubernetes Service for worker pods.
+
+## Scaling Guidance
+
+Scale execution throughput with `queueMode.workerReplicaCount` and `queueMode.workerConcurrency`. The built-in HPA can scale main, worker, and webhook processor deployments from CPU and optional memory utilization.
+
+For queue-based scaling, enable `keda.enabled=true` and configure Redis triggers for workers. KEDA creates `ScaledObject` resources for workers, and optionally webhook processors, instead of the built-in worker/webhook HPAs.
+
+Webhook processors are an optional scaling layer for high-volume production webhook traffic. Enable them when webhook load should be isolated from the UI/API main pods, and configure ingress or load-balancer routing as described above.
 
 ## ServiceAccount
 
@@ -96,12 +126,59 @@ To use the namespace's default ServiceAccount, set `name: ""`. If you set `creat
 | `ingress.enabled` | Create Ingress resource | `false` |
 | `persistence.enabled` | PVC for main pods | `false` |
 | `strategy` | Deployment update strategy | `{}` (k8s default) |
+| `podLabels` | Extra pod-template labels; overrides `commonLabels` on pods only | `{}` |
 | `hpa.main.enabled` | HPA for main pods | `false` |
 | `hpa.worker.enabled` | HPA for worker pods | `false` |
 | `keda.enabled` | KEDA queue-based autoscaling | `false` |
 | `networkPolicy.enabled` | Network policies | `false` |
+| `extraContainers` | Additional sidecar containers on main, worker, and webhook-processor pods | `[]` |
+| `nodePlacement` | Component-specific node placement overrides | `{}` |
+| `extraInitContainers` | Init containers (incl. native sidecars) on all n8n pods | `[]` |
+| `dnsPolicy` / `dnsConfig` | Pod DNS policy + configuration for all n8n pods | `""` / `{}` |
+| `serviceAccount.automountServiceAccountToken` | Pod-level toggle for ServiceAccount token automount | unset |
 
 See [values.yaml](./values.yaml) for the full list of configurable values.
+
+## Extra containers (sidecars)
+
+Use `extraContainers` to add arbitrary containers to **main**, **worker**, and **webhook-processor** pods (for example log shippers or local proxies). They are rendered after the main n8n container and after the optional [task runner](#task-runners) sidecar. Combine with `extraVolumes` and `extraVolumeMounts` when the sidecar needs shared storage. List entries are passed through Helm `tpl`, so you can reference `{{ .Release.Name }}` and other template variables in string fields.
+
+```yaml
+extraContainers:
+  - name: log-shipper
+    image: busybox:1.36
+    args: ["sh", "-c", "while true; do sleep 3600; done"]
+```
+
+## Node Placement
+
+Set global `nodeSelector`, `tolerations`, and `affinity` values to apply the same placement rules to all n8n pods. To target a specific deployment, set the matching `nodePlacement.main`, `nodePlacement.worker`, or `nodePlacement.webhookProcessor` value. Component-specific values take precedence; empty component values fall back to the global settings.
+
+```yaml
+nodeSelector:
+  kubernetes.io/os: linux
+
+nodePlacement:
+  worker:
+    nodeSelector:
+      workload: workers
+    tolerations:
+      - key: dedicated
+        operator: Equal
+        value: n8n-workers
+        effect: NoSchedule
+  webhookProcessor:
+    affinity:
+      podAntiAffinity:
+        preferredDuringSchedulingIgnoredDuringExecution:
+          - weight: 100
+            podAffinityTerm:
+              topologyKey: kubernetes.io/hostname
+```
+
+> **Note:** When `multiMain.enabled=true`, the chart emits an automatic pod-anti-affinity rule to spread main replicas across nodes. Setting `nodePlacement.main.affinity` replaces that auto rule — include your own pod-anti-affinity term if you still want main replicas spread.
+
+See [`examples/node-placement.yaml`](./examples/node-placement.yaml) for a complete configuration that pins `main` to a stable node pool and lets workers run on an autoscaling pool.
 
 ## Task Runners
 
